@@ -5,7 +5,7 @@
 
 流れ:
   1. 127.0.0.1 の空きポートで受け口（HTTP サーバ）を立てる
-  2. GAS の Webアプリを既定のブラウザ（Chrome）で開く
+  2. GAS の Webアプリを既定のブラウザ（Chrome）の**新規ウィンドウ**で開く
      ── 引数は 対象ファイルの絶対パス / 受け口のポート / nonce
   3. GAS が絶対パスからファイルを特定し、中身を返す HTML を出す
   4. その HTML の JavaScript が受け口へ POST する
@@ -30,13 +30,17 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import queue
 import secrets
+import shlex
+import subprocess
 import sys
 import threading
 import time
 import urllib.parse
 import webbrowser
+import winreg
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ------------------------------------------------------------------ #
@@ -104,6 +108,61 @@ def build_url(webapp_url: str, target_path: str, port: int, nonce: str) -> str:
     return webapp_url + sep + query
 
 
+# 実行ファイル名（小文字）→ 新規ウィンドウを開くフラグ
+# （ランチャー本体の workdesk/services/browser.py と同じ表。試作は単体で動かすので写してある）
+_NEW_WINDOW_FLAG = {
+    "chrome.exe": "--new-window",
+    "msedge.exe": "--new-window",
+    "brave.exe": "--new-window",
+    "vivaldi.exe": "--new-window",
+    "opera.exe": "--new-window",
+    "firefox.exe": "-new-window",
+    "librewolf.exe": "-new-window",
+}
+
+
+def _default_browser_exe() -> str | None:
+    """既定ブラウザ（https）の実行ファイルのパス。取れなければ None。"""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations"
+            r"\UrlAssociations\https\UserChoice",
+        ) as key:
+            progid, _ = winreg.QueryValueEx(key, "ProgId")
+        with winreg.OpenKey(
+            winreg.HKEY_CLASSES_ROOT, rf"{progid}\shell\open\command"
+        ) as key:
+            command, _ = winreg.QueryValueEx(key, None)
+        parts = shlex.split(str(command), posix=False)
+    except (OSError, ValueError):
+        return None
+    if not parts:
+        return None
+    exe = parts[0].strip('"')
+    return exe if os.path.isfile(exe) else None
+
+
+def open_in_new_window(url: str) -> bool:
+    """既定ブラウザの新規ウィンドウで URL を開く。
+
+    既存のウィンドウのタブで開くと、そのウィンドウ（後ろにいた／最小化していた）が
+    前面に出てきて、タブを閉じたあとも前面に残る。新規ウィンドウならタブと一緒に
+    ウィンドウごと消えるので、開く前の状態に戻る。
+    新規ウィンドウで開けたら True。無理なら既存ウィンドウのタブで開いて False。
+    """
+    exe = _default_browser_exe()
+    flag = _NEW_WINDOW_FLAG.get(os.path.basename(exe).lower()) if exe else None
+    if flag:
+        try:
+            subprocess.Popen([exe, flag, url], close_fds=True)  # noqa: S603
+            return True
+        except OSError:
+            pass
+    webbrowser.open(url)
+    return False
+
+
 def start_receiver(nonce: str) -> tuple[ThreadingHTTPServer, "queue.Queue[dict]"]:
     """127.0.0.1 の空きポートで受け口を立てる（裏のスレッドで動かす）。"""
     results: "queue.Queue[dict]" = queue.Queue()
@@ -121,7 +180,10 @@ def fetch(webapp_url: str, target_path: str, timeout: float) -> dict | None:
         url = build_url(webapp_url, target_path, port, nonce)
         print("受け口: 127.0.0.1:%d" % port)
         print("開く URL: %s" % url)
-        webbrowser.open(url)
+        if open_in_new_window(url):
+            print("新規ウィンドウで開きました")
+        else:
+            print("新規ウィンドウで開けなかったので、既存ウィンドウのタブで開きました")
         try:
             return results.get(timeout=timeout)
         except queue.Empty:
