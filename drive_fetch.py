@@ -241,6 +241,8 @@ SW_MINIMIZE = 6
 SW_SHOWMINNOACTIVE = 7
 WM_CLOSE = 0x0010
 SW_SHOWNOACTIVATE = 4
+SW_SHOWMAXIMIZED = 3
+WPF_RESTORETOMAXIMIZED = 0x2
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
 LWA_ALPHA = 0x2
@@ -382,11 +384,18 @@ def restore_size(hwnd: int, original: WINDOWPLACEMENT | None) -> None:
     wp.rcNormalPosition = original.rcNormalPosition
     if CLOSE_MODE == "restore":
         make_transparent(hwnd)
-        wp.showCmd = SW_SHOWNOACTIVATE     # 元の大きさで表示するが焦点は奪わない
+        if original.showCmd == SW_SHOWMAXIMIZED:
+            # 最大化で開いていたなら最大化で閉じる（Chrome は閉じたときの実際の状態を保存する
+            # ので、最小化や通常のまま閉じると次から最大化で開かなくなる）。焦点は移る
+            wp.showCmd = SW_SHOWMAXIMIZED
+        else:
+            wp.showCmd = SW_SHOWNOACTIVATE     # 元の大きさで表示するが焦点は奪わない
         _user32.SetWindowPlacement(hwnd, ctypes.byref(wp))
         time.sleep(RESTORE_SETTLE_SECONDS)
     else:  # "placement"
         wp.showCmd = SW_SHOWMINNOACTIVE    # 最小化のまま、元に戻したときの大きさだけ書き換える
+        if original.showCmd == SW_SHOWMAXIMIZED:
+            wp.flags |= WPF_RESTORETOMAXIMIZED   # 「元に戻すと最大化」も引き継ぐ
         _user32.SetWindowPlacement(hwnd, ctypes.byref(wp))
     print("[窓] 大きさを戻しました（%s）: %s" % (CLOSE_MODE, describe(get_placement(hwnd))))
 
