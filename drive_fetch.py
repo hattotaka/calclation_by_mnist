@@ -13,7 +13,9 @@
   5. その HTML の JavaScript が受け口へ POST する
   6. nonce が一致した 1 回だけ受け取り、コンソールへ出す
   7. 新しく出てきたウィンドウのうち、タイトルが GAS の画面のものへ WM_CLOSE を送って閉じる
-     （前面かどうかは問わない）。見つからなければ従来の Ctrl+W に退避する
+     （前面かどうかは問わない）。見つからなければ従来の Ctrl+W に退避する。
+     閉じる前に、見つけた時点の大きさへ戻す（CLOSE_MODE。Chrome が閉じたウィンドウの
+     大きさを覚えて次に使うため）
 
 Google とのやり取り（認証）はすべて Chrome が行う。Python が触るのは
 127.0.0.1 に届いた送信だけ。
@@ -70,7 +72,19 @@ CLOSE_WAIT_SECONDS = 2.0
 #   "start" … 起動時に「最小化で開いて」と頼む（STARTUPINFO）＋ 見つけ次第最小化も併用。
 #             Chrome が頼みを聞いたかは、見つけた時点で最小化済みだったかでコンソールに出る
 #   "none"  … 最小化しない（hwnd で閉じる部分だけを試す）
-MINIMIZE_MODE = "after"
+MINIMIZE_MODE = "start"
+
+# 閉じる前にウィンドウの大きさをどう戻すか（検証で切り替える）
+#   Chrome は閉じたウィンドウの「元に戻したときの大きさ」を覚え、次の新規ウィンドウに使う。
+#   描き始めのうちに最小化すると、その大きさが小さいまま保存されることがある（会社で観察）。
+#   戻す先は「見つけた時点（最小化する前）の大きさ」。
+#   "restore"   … 透明（α=0）にしてから、焦点を奪わずに元の大きさで表示 → 少し待って閉じる
+#   "placement" … 最小化したまま「元に戻したときの大きさ」だけを書き換えて閉じる（画面に出ない）
+#   "none"      … 何もせず閉じる（前回の版と同じ）
+CLOSE_MODE = "restore"
+
+# "restore" で表示してから閉じるまで待つ秒数（Chrome が大きさを受け取る間）
+RESTORE_SETTLE_SECONDS = 0.3
 
 # 開いてから新しいウィンドウを探し続ける秒数（Chrome が起動していない状態からも含む）
 WINDOW_SEARCH_SECONDS = 15.0
@@ -226,6 +240,51 @@ WS_MINIMIZEBOX = 0x00020000
 SW_MINIMIZE = 6
 SW_SHOWMINNOACTIVE = 7
 WM_CLOSE = 0x0010
+SW_SHOWNOACTIVATE = 4
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+LWA_ALPHA = 0x2
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", wintypes.RECT),
+    ]
+
+
+_user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+_user32.SetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+_user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+_user32.SetWindowLongW.restype = wintypes.LONG
+_user32.SetLayeredWindowAttributes.argtypes = [
+    wintypes.HWND, wintypes.COLORREF, wintypes.BYTE, wintypes.DWORD]
+
+
+def get_placement(hwnd: int) -> WINDOWPLACEMENT:
+    """ウィンドウの配置（rcNormalPosition＝元に戻したときの位置と大きさ）。"""
+    wp = WINDOWPLACEMENT()
+    wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+    _user32.GetWindowPlacement(hwnd, ctypes.byref(wp))
+    return wp
+
+
+def describe(wp: WINDOWPLACEMENT) -> str:
+    """配置をコンソール用の短い文字列にする。"""
+    r = wp.rcNormalPosition
+    return "元の大きさ %dx%d（%d,%d）/ showCmd=%d" % (
+        r.right - r.left, r.bottom - r.top, r.left, r.top, wp.showCmd)
+
+
+def make_transparent(hwnd: int) -> None:
+    """ウィンドウを透明（α=0）にする。閉じる直前にだけ使う。"""
+    ex = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
+    _user32.SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA)
 
 
 def window_title(hwnd: int) -> str:
@@ -297,17 +356,39 @@ def find_opened_window(before: set[int], title: str) -> int | None:
     return None
 
 
-def close_opened_window(before: set[int], title: str) -> int | None:
+def close_opened_window(before: set[int], title: str,
+                        saved: dict[int, WINDOWPLACEMENT]) -> int | None:
     """開く前に無かった Chrome のウィンドウのうち、タイトルが一致するものへ WM_CLOSE を送る。
 
     送った hwnd を返す。見つからなければ None（何も閉じない）。
     前面かどうかは問わない ── 最小化していても、別のウィンドウを前面に出していても閉じられる。
+    閉じる前に、saved（見つけた時点＝最小化する前の配置）の大きさへ戻す（CLOSE_MODE）。
     """
     for hwnd in chrome_windows() - before:
         if window_title(hwnd).startswith(title):
+            restore_size(hwnd, saved.get(hwnd))
             _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
             return hwnd
     return None
+
+
+def restore_size(hwnd: int, original: WINDOWPLACEMENT | None) -> None:
+    """閉じる前に「元に戻したときの大きさ」を original へ戻す（CLOSE_MODE で方法を選ぶ）。"""
+    now = get_placement(hwnd)
+    print("[窓] 閉じる前: %s" % describe(now))
+    if CLOSE_MODE == "none" or original is None:
+        return
+    wp = get_placement(hwnd)
+    wp.rcNormalPosition = original.rcNormalPosition
+    if CLOSE_MODE == "restore":
+        make_transparent(hwnd)
+        wp.showCmd = SW_SHOWNOACTIVATE     # 元の大きさで表示するが焦点は奪わない
+        _user32.SetWindowPlacement(hwnd, ctypes.byref(wp))
+        time.sleep(RESTORE_SETTLE_SECONDS)
+    else:  # "placement"
+        wp.showCmd = SW_SHOWMINNOACTIVE    # 最小化のまま、元に戻したときの大きさだけ書き換える
+        _user32.SetWindowPlacement(hwnd, ctypes.byref(wp))
+    print("[窓] 大きさを戻しました（%s）: %s" % (CLOSE_MODE, describe(get_placement(hwnd))))
 
 
 def start_receiver(nonce: str) -> tuple[ThreadingHTTPServer, "queue.Queue[dict]"]:
@@ -318,12 +399,15 @@ def start_receiver(nonce: str) -> tuple[ThreadingHTTPServer, "queue.Queue[dict]"
     return server, results
 
 
-def fetch(webapp_url: str, target_path: str, timeout: float) -> tuple[dict | None, set[int]]:
+def fetch(webapp_url: str, target_path: str, timeout: float
+          ) -> tuple[dict | None, set[int], dict[int, WINDOWPLACEMENT]]:
     """Webアプリを開いて結果を待つ。
 
-    (結果, 開く前の Chrome のウィンドウの集合) を返す。結果は時間内に届かなければ None。
+    (結果, 開く前の Chrome のウィンドウの集合, 見つけた時点の配置) を返す。
+    結果は時間内に届かなければ None。
     待っている間に、新しく出てきたウィンドウを探して最小化する。
     """
+    saved: dict[int, WINDOWPLACEMENT] = {}
     nonce = secrets.token_urlsafe(16)
     server, results = start_receiver(nonce)
     try:
@@ -332,6 +416,8 @@ def fetch(webapp_url: str, target_path: str, timeout: float) -> tuple[dict | Non
         print("受け口: 127.0.0.1:%d" % port)
         print("開く URL: %s" % url)
         before = chrome_windows()
+        for h in before:    # 参考: 元からある Chrome のウィンドウの大きさ
+            print("[窓] 元からある Chrome: %s" % describe(get_placement(h)))
         started = time.monotonic()
         if open_in_new_window(url, minimized=(MINIMIZE_MODE == "start")):
             print("新規ウィンドウで開きました（最小化: %s）" % MINIMIZE_MODE)
@@ -346,8 +432,10 @@ def fetch(webapp_url: str, target_path: str, timeout: float) -> tuple[dict | Non
                 if hwnd:
                     searching = False
                     iconic = bool(_user32.IsIconic(hwnd))
+                    saved[hwnd] = get_placement(hwnd)
                     print("[窓] 見つけました: hwnd=0x%X / %.2f 秒後 / 最小化済み=%s / タイトル=%r"
                           % (hwnd, now - started, iconic, window_title(hwnd)))
+                    print("[窓] 見つけた時点: %s" % describe(saved[hwnd]))
                     if MINIMIZE_MODE != "none" and not iconic:
                         # SW_MINIMIZE は次のウィンドウを前面にする（SW_SHOWMINNOACTIVE だと
                         # 見えない Chrome に入力の焦点が残りうる）
@@ -357,10 +445,10 @@ def fetch(webapp_url: str, target_path: str, timeout: float) -> tuple[dict | Non
                     searching = False
                     print("[窓] %.0f 秒以内に新しいウィンドウが見つかりませんでした" % WINDOW_SEARCH_SECONDS)
             try:
-                return results.get(timeout=POLL_SECONDS), before
+                return results.get(timeout=POLL_SECONDS), before, saved
             except queue.Empty:
                 if now - started >= timeout:
-                    return None, before
+                    return None, before, saved
     finally:
         server.shutdown()
         server.server_close()
@@ -401,12 +489,12 @@ def close_page_tab(title: str, wait: float) -> bool:
 
 
 def main() -> int:
-    result, before = fetch(WEBAPP_URL, TARGET_PATH, TIMEOUT_SECONDS)
+    result, before, saved = fetch(WEBAPP_URL, TARGET_PATH, TIMEOUT_SECONDS)
     if result is None:
         print("タイムアウト: %d 秒以内に GAS から届きませんでした" % TIMEOUT_SECONDS)
         return 1
     # エラーのときも GAS の画面は出ているので閉じる
-    hwnd = close_opened_window(before, PAGE_TITLE)
+    hwnd = close_opened_window(before, PAGE_TITLE, saved)
     if hwnd:
         print("[窓] hwnd=0x%X に WM_CLOSE を送りました" % hwnd)
     else:
